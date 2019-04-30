@@ -1,0 +1,5 @@
+---
+plugin: proxmox
+url: https://pve.example.com:8006
+username: root
+password: password

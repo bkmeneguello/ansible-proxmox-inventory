@@ -1,26 +1,80 @@
-#!/usr/bin/env python3
+from __future__ import (absolute_import, division, print_function)
+
+import re
 
 import requests
-
-try:
-    import json
-except ImportError:
-    import simplejson as json
-import os
-import sys
-from optparse import OptionParser
-# import logging
-
+import urllib3
+import yaml
+from ansible.errors import AnsibleParserError
+from ansible.plugins.inventory import BaseInventoryPlugin, Constructable, Cacheable
 from six import iteritems
+from yaml.scanner import ScannerError
+
+__metaclass__ = type
 
 # disable InsecureRequestWarning
-requests.packages.urllib3.disable_warnings()
-#enable debug loggig
-# logging.basicConfig(level=logging.DEBUG)
+urllib3.disable_warnings()
+
+
+DOCUMENTATION = '''
+    name: proxmox
+    plugin_type: inventory
+    short_description: Proxmox inventory source
+    version_added: "2.7"
+    author:
+      - Bruno Meneguello
+    description:
+        Inventory plugin for Proxmox
+    extends_documentation_fragment:
+      - inventory_cache
+    requirements:
+      - "Python >= 2.7"
+    options:
+        url:
+            description: Proxmox URL
+            env:
+              - name: PROXMOX_URL
+            ini:
+              - section: proxmox
+                key: url
+        username:
+            description: Proxmox API username
+            env:
+              - name: PROXMOX_USERNAME
+            ini:
+              - section: proxmox
+                key: username
+        password:
+            description: Proxmox API password
+            env:
+              - name: PROXMOX_PASSWORD
+            ini:
+              - section: proxmox
+                key: password
+        qemu_interface:
+            description: Interface to check IP 
+            env:
+              - name: PROXMOX_QEMU_INTERFACE
+            ini:
+              - section: proxmox
+                key: qemu_interface
+        qemu_interface_ignore:
+            description: Regex of ignored interface names
+            default: lo|((br-|docker|veth).*)
+            env:
+              - name: PROXMOX_QEMU_INTERFACE_IGNORE
+            ini:
+              - section: proxmox
+                key: qemu_interface_ignore
+        validate:
+            description: TBD
+            default: false
+'''
+
 
 class ProxmoxNodeList(list):
     def get_names(self):
-        return [node['node'] for node in self if node['status'] == 'online' ]
+        return [node['node'] for node in self if node['status'] == 'online']
 
 
 class ProxmoxVM(dict):
@@ -31,25 +85,26 @@ class ProxmoxVM(dict):
         return variables
 
 
-class ProxmoxVMList(list):
-    def __init__(self, data=[], pxmxver=0.0):
+class ProxmoxVMList(object):
+    def __init__(self, data=None, pxmxver=0.0):
         self.ver = pxmxver
-        for item in data:
-            self.append(ProxmoxVM(item))
+        self.vms = []
+        for item in data or []:
+            self.vms.append(ProxmoxVM(item))
 
     def get_names(self):
         if self.ver >= 4.0:
-            return [vm['name'] for vm in self if vm['template'] != 1]
+            return [vm['name'] for vm in self.vms if vm['template'] != 1]
         else:
-            return [vm['name'] for vm in self]
+            return [vm['name'] for vm in self.vms]
 
     def get_by_name(self, name):
-        results = [vm for vm in self if vm['name'] == name]
+        results = [vm for vm in self.vms if vm['name'] == name]
         return results[0] if len(results) > 0 else None
 
     def get_variables(self):
         variables = {}
-        for vm in self:
+        for vm in self.vms:
             variables[vm['name']] = vm.get_variables()
 
         return variables
@@ -67,60 +122,40 @@ class ProxmoxVersion(dict):
 
 class ProxmoxPool(dict):
     def get_members_name(self):
-        return [member['name'] for member in self['members'] if member['template'] != 1]
+        return [member['name'] for member in self['members'] if 'template' in member and member['template'] != 1]
 
 
 class ProxmoxAPI(object):
-    def __init__(self, options, config_path):
-        self.options = options
+    def __init__(self, plugin):
         self.credentials = None
 
-        if not options.url or not options.username or not options.password:
-            if os.path.isfile(config_path):
-                with open(config_path, "r") as config_file:
-                    config_data = json.load(config_file)
-                    if not options.url:
-                        try:
-                            options.url = config_data["url"]
-                        except KeyError:
-                            options.url = None
-                    if not options.username:
-                        try:
-                            options.username = config_data["username"]
-                        except KeyError:
-                            options.username = None
-                    if not options.password:
-                        try:
-                            options.password = config_data["password"]
-                        except KeyError:
-                            options.password = None
-                    if not options.qemu_interface:
-                        try:
-                            options.qemu_interface = config_data["qemu_interface"]
-                        except KeyError:
-                            options.qemu_interface = 'lo'
+        if not plugin.get_option('url'):
+            raise AnsibleParserError('missing mandatory variable url')
+        self.url = plugin.get_option('url')
 
-        if not options.url:
-            raise Exception('Missing mandatory parameter --url (or PROXMOX_URL or "url" key in config file).')
-        elif not options.username:
-            raise Exception(
-                'Missing mandatory parameter --username (or PROXMOX_USERNAME or "username" key in config file).')
-        elif not options.password:
-            raise Exception(
-                'Missing mandatory parameter --password (or PROXMOX_PASSWORD or "password" key in config file).')
+        if not plugin.get_option('username'):
+            raise AnsibleParserError('missing mandatory variable username')
+        self.username = plugin.get_option('username')
+
+        if not plugin.get_option('password'):
+            raise AnsibleParserError('missing mandatory variable password')
+        self.password = plugin.get_option('password')
+
+        self.validate = plugin.get_option('validate')
+
         # URL should end with a trailing slash
-        if not options.url.endswith("/"):
-            options.url = options.url + "/"
+        if not self.url.endswith("/"):
+            self.url = self.url + "/"
 
     def auth(self):
-        request_path = '{0}api2/json/access/ticket'.format(self.options.url)
+        request_path = '{0}api2/json/access/ticket'.format(self.url)
 
         request_params = {
-            'username': self.options.username,
-            'password': self.options.password,
+            'username': self.username,
+            'password': self.password,
         }
 
-        data = requests.post(request_path, data=request_params, verify=self.options.validate).json()
+        data = requests.post(request_path, data=request_params, verify=self.validate).json()
 
         self.credentials = {
             'ticket': data['data']['ticket'],
@@ -128,15 +163,15 @@ class ProxmoxAPI(object):
         }
 
     def get(self, url, data=None):
-        request_path = '{0}{1}'.format(self.options.url, url)
+        request_path = '{0}{1}'.format(self.url, url)
 
         headers = {'Cookie': 'PVEAuthCookie={0}'.format(self.credentials['ticket'])}
         response_raw = requests.get(
-                            request_path,
-                            data=data,
-                            headers=headers,
-                            verify=self.options.validate
-                            )
+            request_path,
+            data=data,
+            headers=headers,
+            verify=self.validate
+        )
         response = response_raw.json()
 
         return response['data']
@@ -147,8 +182,8 @@ class ProxmoxAPI(object):
     def vms_by_type(self, node, type):
         return ProxmoxVMList(self.get('api2/json/nodes/{0}/{1}'.format(node, type)), self.version().get_version())
 
-    def vm_description_by_type(self, node, vm, type):
-        return self.get('api2/json/nodes/{0}/{1}/{2}/config'.format(node, type, vm))
+    def vm_description_by_type(self, node, vm, vm_type):
+        return self.get('api2/json/nodes/{0}/{1}/{2}/config'.format(node, vm_type, vm))
 
     def node_qemu(self, node):
         return self.vms_by_type(node, 'qemu')
@@ -156,12 +191,11 @@ class ProxmoxAPI(object):
     def node_qemu_description(self, node, vm):
         return self.vm_description_by_type(node, vm, 'qemu')
 
-    
     def node_qemu_ip(self, node, vm):
         try:
             return self.get('api2/json/nodes/{0}/qemu/{1}/agent/network-get-interfaces'.format(node, vm))
-        except:
-            return False
+        except Exception:
+            return {'result': []}
 
     def pools(self):
         return ProxmoxPoolList(self.get('api2/json/pools'))
@@ -171,146 +205,96 @@ class ProxmoxAPI(object):
 
     def version(self):
         return ProxmoxVersion(self.get('api2/json/version'))
-    
-def main_list(options, config_path):
-    results = {
-        'all': {
-            'hosts': [],
-        },
-        '_meta': {
-            'hostvars': {},
-        }
-    }
 
-    proxmox_api = ProxmoxAPI(options, config_path)
-    proxmox_api.auth()
 
-    for node in proxmox_api.nodes().get_names():
-        try:
-            qemu_list = proxmox_api.node_qemu(node)
-        except requests.HTTPError as error:
-            # Proxmox API raises error code 595 when target node is unavailable, skip it
-            if error.response.status_code == 595:
-                continue
-            # on other errors
-            raise PipelineServiceError("{reason}".format(reason=error))
-        results['all']['hosts'] += qemu_list.get_names()
-        results['_meta']['hostvars'].update(qemu_list.get_variables())
+class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
-        # Merge QEMU and Containers lists from this node
-        node_hostvars = qemu_list.get_variables().copy()
+    NAME = 'proxmox'
 
-        # Check only VM/containers from the current node
-        for vm in node_hostvars:
-            vmid = results['_meta']['hostvars'][vm]['proxmox_vmid']
-            node_ip = proxmox_api.node_qemu_ip(node, vmid)
-            if node_ip:
+    def __init__(self):
+        super(InventoryModule, self).__init__()
+
+    def verify_file(self, path):
+
+        valid = False
+        if super(InventoryModule, self).verify_file(path):
+            if path.endswith(('proxmox.yaml', 'proxmox.yml')):
+                valid = True
+
+        return valid
+
+    def parse(self, inventory, loader, path, cache=False):
+
+        super(InventoryModule, self).parse(inventory, loader, path, cache=cache)
+
+        self._read_config_data(path)
+
+        proxmox_api = ProxmoxAPI(self)
+        proxmox_api.auth()
+
+        for node in proxmox_api.nodes().get_names():
+            try:
+                qemu_list = proxmox_api.node_qemu(node)
+            except requests.HTTPError as error:
+                # Proxmox API raises error code 595 when target node is unavailable, skip it
+                if error.response.status_code == 595:
+                    continue
+                # on other errors
+                raise AnsibleParserError("{reason}".format(reason=error), orig_exc=error)
+            for host in qemu_list.get_names():
+                self.inventory.add_host(host)
+                variables = qemu_list.get_by_name(host).get_variables()
+                for key, value in variables.items():
+                    self.inventory.set_variable(host, key, value)
+                vmid = variables['proxmox_vmid']
+                node_ip = proxmox_api.node_qemu_ip(node, vmid)
+                if not node_ip or 'error' in node_ip['result']:
+                    continue  # FIXME
                 for vm_interface in node_ip['result']:
-                    if vm_interface['name'] == options.qemu_interface:
-                        results['_meta']['hostvars'][vm]['ansible_host'] = vm_interface['ip-addresses'][0]['ip-address']
-            try:
-                type = results['_meta']['hostvars'][vm]['proxmox_type']
-            except KeyError:
-                type = 'qemu'
-            try:
-                description = proxmox_api.vm_description_by_type(node, vmid, type)['description']
-            except KeyError:
-                description = None
+                    if self.interface_matches(vm_interface):
+                        for ip_address in vm_interface['ip-addresses']:
+                            if ip_address['ip-address-type'] == 'ipv4':
+                                self.inventory.set_variable(host, 'ansible_host', ip_address['ip-address'])
+                                break
+                vm_type = variables.get('proxmox_type', 'qemu')
 
-            try:
-                metadata = json.loads(description)
-            except TypeError:
-                metadata = {}
-            except ValueError:
-                metadata = {
-                    'notes': description
-                }
+                description = proxmox_api.vm_description_by_type(node, vmid, vm_type).get('description')
 
-            if 'groups' in metadata:
-                # print metadata
-                for group in metadata['groups']:
-                    if group not in results:
-                        results[group] = {
-                            'hosts': []
-                        }
-                    results[group]['hosts'] += [vm]
+                metadata = None
+                for chunk in description.split('---'):
+                    try:
+                        metadata = yaml.load(chunk)
+                    except ScannerError:
+                        pass
 
-            # Create group 'running'
-            # so you can: --limit 'running'
-            status = results['_meta']['hostvars'][vm]['proxmox_status']
-            if status == 'running':
-                if 'running' not in results:
-                    results['running'] = {
-                        'hosts': []
-                    }
-                results['running']['hosts'] += [vm]
+                if metadata:
+                    if 'ansible_groups' in metadata:
+                        for group_name in metadata['ansible_groups']:
+                            if group_name not in self.inventory.get_groups_dict():
+                                self.inventory.add_group(group_name)
+                            self.inventory.add_child(group_name, host)
+                    if 'ansible_vars' in metadata:
+                        for name, value in metadata['ansible_vars'].items():
+                            self.inventory.set_variable(host, name, value)
 
-            results['_meta']['hostvars'][vm].update(metadata)
+                # Create group 'running'
+                # so you can: --limit 'running'
+                if variables['proxmox_status'] == 'running':
+                    if 'running' not in self.inventory.get_groups_dict():
+                        self.inventory.add_group('running')
+                    self.inventory.add_child('running', host)
 
-    # pools
-    for pool in proxmox_api.pools().get_names():
-        results[pool] = {
-            'hosts': proxmox_api.pool(pool).get_members_name(),
-        }
+        # pools
+        for pool in proxmox_api.pools().get_names():
+            if pool not in self.inventory.get_groups_dict():
+                self.inventory.add_group(pool)
+            for host in proxmox_api.pool(pool).get_members_name():
+                self.inventory.add_child(pool, host)
 
-    return results
+        self.inventory.reconcile_inventory()
 
-
-def main_host(options, config_path):
-    proxmox_api = ProxmoxAPI(options, config_path)
-    proxmox_api.auth()
-
-    for node in proxmox_api.nodes().get_names():
-        qemu_list = proxmox_api.node_qemu(node)
-        qemu = qemu_list.get_by_name(options.host)
-        if qemu:
-            return qemu.get_variables()
-
-    return {}
-
-
-def main():
-    config_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        os.path.splitext(os.path.basename(__file__))[0] + ".json"
-    )
-
-    bool_validate_cert = True
-    if os.path.isfile(config_path):
-        with open(config_path, "r") as config_file:
-            config_data = json.load(config_file)
-            try:
-                bool_validate_cert = config_data["validateCert"]
-            except KeyError:
-                pass
-    if 'PROXMOX_INVALID_CERT' in os.environ:
-        bool_validate_cert = False
-
-    parser = OptionParser(usage='%prog [options] --list | --host HOSTNAME')
-    parser.add_option('--list', action="store_true", default=False, dest="list")
-    parser.add_option('--host', dest="host")
-    parser.add_option('--url', default=os.environ.get('PROXMOX_URL'), dest='url')
-    parser.add_option('--qemu_interface', default=os.environ.get('QEMU_INTERFACE'), dest='qemu_interface')
-    parser.add_option('--username', default=os.environ.get('PROXMOX_USERNAME'), dest='username')
-    parser.add_option('--password', default=os.environ.get('PROXMOX_PASSWORD'), dest='password')
-    parser.add_option('--pretty', action="store_true", default=False, dest='pretty')
-    parser.add_option('--trust-invalid-certs', action="store_false", default=bool_validate_cert, dest='validate')
-    (options, args) = parser.parse_args()
-
-    if options.list:
-        data = main_list(options, config_path)
-    elif options.host:
-        data = main_host(options, config_path)
-    else:
-        parser.print_help()
-        sys.exit(1)
-
-    indent = None
-    if options.pretty:
-        indent = 2
-
-    print((json.dumps(data, indent=indent)))
-
-
-if __name__ == '__main__':
-    main()
+    def interface_matches(self, vm_interface):
+        if self.get_option('qemu_interface'):
+            return vm_interface['name'] == self.get_option('qemu_interface')
+        else:
+            return not re.match(self.get_option('qemu_interface_ignore'), vm_interface['name'], re.IGNORECASE)
